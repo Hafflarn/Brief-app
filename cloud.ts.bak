@@ -1,0 +1,79 @@
+import type { Attachment, State } from './model';
+import { supabase } from './supabase';
+
+export type Snapshot = { state: State; user: string; company: string; revision: number };
+const client = () => { if (!supabase) throw Error('Supabase är inte konfigurerat.'); return supabase; };
+
+export async function hydrate(result: Snapshot): Promise<Snapshot> {
+ const attachments = result.state.projects.flatMap(p=>p.orders.flatMap(o=>o.notes.flatMap(n=>n.files)));
+ const paths = attachments.map(f=>f.path).filter((p):p is string=>Boolean(p));
+ if (paths.length) {
+  try {
+  const { data: urls, error: fileError } = await client().storage.from('brief-files').createSignedUrls(paths, 3600);
+  // A signing failure must not turn a committed write into an apparent failure.
+  // Download links still fetch through authenticated Storage on demand.
+  if (fileError) return result;
+  const map = new Map(urls?.map(u=>[u.path,u.signedUrl]));
+  for (const file of attachments) file.data = map.get(file.path)||'';
+  } catch {
+   return result;
+  }
+ }
+ return result;
+}
+
+export async function loadCloud(): Promise<Snapshot> {
+ const { data, error } = await client().rpc('brief_load');
+ if (error) throw Error(error.message);
+ return hydrate(data as Snapshot);
+}
+
+// The UI changes one business action per save. The database authorizes and
+// applies that action under a row lock; browser-provided audit text is ignored.
+export function commandFor(before: State, after: State): Record<string, unknown> {
+ const newPerson = after.people.find(p=>!before.people.some(old=>old.id===p.id));
+ if (newPerson) return { kind:'invite_member', name:newPerson.name, email:newPerson.email, role:newPerson.role };
+ const newCustomer = after.customers.find(c=>!before.customers.some(old=>old.id===c.id));
+ if (newCustomer) return { kind:'create_customer', ...newCustomer };
+ const customerProject = after.customerProjects.find(p=>!before.customerProjects.includes(p));
+ if (customerProject) return { kind:'create_customer_project', number:customerProject };
+ for (const project of after.projects) {
+  const previousProject = before.projects.find(p=>p.id===project.id);
+  for (const order of project.orders) {
+   const previous = previousProject?.orders.find(o=>o.id===order.id);
+   if (!previous) return { kind:'create_order', project: { ...project, orders:undefined }, order: { ...order, events:undefined, notes:undefined, participants:undefined } };
+   if (!previous.acceptedAt && order.acceptedAt) return { kind:'accept_order', order:order.id };
+   if (previous.status!==order.status) return { kind:'set_status', order:order.id, status:order.status };
+   const participant = order.participants.find(p=>!previous.participants.some(old=>old.user===p.user));
+   if (participant) return { kind:'invite_colleague', order:order.id, member:participant.user };
+   if (order.participants.some(p=>p.acceptedAt&&!previous.participants.find(old=>old.user===p.user)?.acceptedAt)) return { kind:'accept_invitation', order:order.id };
+   const note = order.notes.find(n=>!previous.notes.some(old=>old.id===n.id));
+   if (note) return { kind:'add_note', order:order.id, text:note.text, files:note.files };
+  }
+ }
+ throw Error('Ingen ändring att spara.');
+}
+
+export async function saveCloud(before: State, after: State, snapshot: Snapshot): Promise<Snapshot> {
+ const command = commandFor(before, after);
+ try {
+  if (command.kind==='add_note') {
+   const files = command.files as Attachment[];
+   command.files = await Promise.all(files.map(async file=>{
+    if (file.path) return { id:file.id, name:file.name, type:file.type, path:file.path };
+    const blob = await (await fetch(file.data)).blob();
+    const path = `${snapshot.company}/${command.order}/${snapshot.user}/${file.id}`;
+    const { error } = await client().storage.from('brief-files').upload(path, blob, { contentType:file.type||'application/octet-stream', upsert:false });
+    if (error) throw Error('Bilagan kunde inte laddas upp: '+error.message);
+    return { id:file.id, name:file.name, type:file.type||'application/octet-stream', path };
+   }));
+  }
+  const { data, error } = await client().rpc('brief_apply', { expected_revision:snapshot.revision, command });
+  if (error) throw Error(error.message);
+  return hydrate(data as Snapshot);
+ } catch (error) {
+  // Failed writes leave pending UI data intact. Uploaded objects may be
+  // unreferenced after uncertain network results; never delete a committed file.
+  throw error;
+ }
+}
